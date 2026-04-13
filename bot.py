@@ -49,6 +49,18 @@ def random_word() -> str:
     return random.choice(WORDS)
 
 
+# Apostrophes we want to treat as equivalent / ignore when comparing guesses.
+_APOSTROPHES = "'\u2019\u02bc\u02b9\u2018`\u00b4"
+
+
+def normalize(text: str) -> str:
+    """Lowercase and strip any apostrophes / spaces for guess comparison."""
+    text = text.strip().lower()
+    for ch in _APOSTROPHES:
+        text = text.replace(ch, "")
+    return text
+
+
 def pick_word(used: set[str]) -> str:
     """Pick a random word that hasn't been guessed in this game yet.
 
@@ -430,8 +442,7 @@ async def guess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if user.id == game["leader_id"]:
         return
 
-    guess = update.message.text.strip().lower()
-    if guess != game["word"].lower():
+    if normalize(update.message.text) != normalize(game["word"]):
         return
 
     # ---- Correct guess ----
