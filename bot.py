@@ -135,11 +135,12 @@ def _leader_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _claim_keyboard() -> InlineKeyboardMarkup:
+def _claim_keyboard(like_count: int = 0) -> InlineKeyboardMarkup:
+    like_label = f"👍 Лайк поясненню ({like_count})"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🎯 Хочу пояснювати", callback_data="claim")],
-            [InlineKeyboardButton("👍 Лайк поясненню", callback_data="like")],
+            [InlineKeyboardButton(like_label, callback_data="like")],
         ]
     )
 
@@ -347,6 +348,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         game["likes_in_round"].add(user_id)
         increment_likes(chat_id, prev_id, prev_name or "")
         await query.answer(f"👍 Дякую! Лайк для {prev_name}.", show_alert=True)
+
+        # Update the button label with new like count
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_claim_keyboard(len(game["likes_in_round"]))
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
