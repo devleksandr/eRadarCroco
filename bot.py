@@ -135,13 +135,20 @@ def _leader_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _claim_keyboard(like_count: int = 0) -> InlineKeyboardMarkup:
+def _claim_keyboard(round_id: int, like_count: int = 0) -> InlineKeyboardMarkup:
     like_label = f"👍 Лайк поясненню ({like_count})"
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🎯 Хочу пояснювати", callback_data="claim")],
-            [InlineKeyboardButton(like_label, callback_data="like")],
+            [InlineKeyboardButton("🎯 Хочу пояснювати", callback_data=f"claim:{round_id}")],
+            [InlineKeyboardButton(like_label, callback_data=f"like:{round_id}")],
         ]
+    )
+
+
+def _like_only_keyboard(round_id: int, like_count: int) -> InlineKeyboardMarkup:
+    like_label = f"👍 Лайк поясненню ({like_count})"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(like_label, callback_data=f"like:{round_id}")]]
     )
 
 
@@ -205,9 +212,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "winner_id": None,
         "winner_name": None,
         "claim_open_at": 0.0,
-        "previous_explainer_id": None,
-        "previous_explainer_name": None,
-        "likes_in_round": set(),
+        "pending_round_id": None,  # round awaiting a claim
+        "rounds": {},              # round_id -> {explainer_id, explainer_name, likers, claim_taken}
+        "next_round_id": 1,
         "timeout_job": None,
     }
 
@@ -265,11 +272,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_name = query.from_user.first_name
 
     game = games.get(chat_id)
+    data = query.data or ""
+
+    # Likes must work even when the game is no longer active (old messages).
+    # So handle likes BEFORE the "game not active" early-return.
+    if data.startswith("like:"):
+        if not game:
+            await query.answer("Гра не знайдена.", show_alert=True)
+            return
+        try:
+            round_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await query.answer("Некоректні дані.", show_alert=True)
+            return
+        round_data = game.get("rounds", {}).get(round_id)
+        if not round_data:
+            await query.answer("Цей раунд вже недоступний.", show_alert=True)
+            return
+        if user_id == round_data["explainer_id"]:
+            await query.answer("Самому собі лайк ставити не можна 🙈", show_alert=True)
+            return
+        if user_id in round_data["likers"]:
+            await query.answer("Ви вже поставили лайк за це пояснення.", show_alert=True)
+            return
+
+        round_data["likers"].add(user_id)
+        increment_likes(chat_id, round_data["explainer_id"], round_data["explainer_name"])
+        await query.answer(
+            f"👍 Дякую! Лайк для {round_data['explainer_name']}.",
+            show_alert=True,
+        )
+
+        # Rebuild the keyboard for THIS message — keep claim button only if
+        # claim is still pending for this round.
+        count = len(round_data["likers"])
+        if round_data["claim_taken"]:
+            new_markup = _like_only_keyboard(round_id, count)
+        else:
+            new_markup = _claim_keyboard(round_id, count)
+        try:
+            await query.edit_message_reply_markup(reply_markup=new_markup)
+        except Exception:
+            pass
+        return
+
+    # For all other buttons, require an active game.
     if not game or not game.get("active"):
         await query.answer("Гра не активна.", show_alert=True)
         return
-
-    data = query.data
 
     # ---- Leader-only buttons ----
     if data == "show_word":
@@ -292,8 +342,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer(f"🔤 {game['word']}", show_alert=True)
 
     # ---- Claim ("Хочу пояснювати") ----
-    elif data == "claim":
-        if not game.get("claim_open"):
+    elif data.startswith("claim:"):
+        try:
+            round_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await query.answer("Некоректні дані.", show_alert=True)
+            return
+
+        round_data = game.get("rounds", {}).get(round_id)
+        if not round_data or round_data["claim_taken"]:
+            await query.answer("Це пояснення вже передано.", show_alert=True)
+            return
+        if not game.get("claim_open") or game.get("pending_round_id") != round_id:
             await query.answer("Зараз неможливо стати пояснюючим.", show_alert=True)
             return
 
@@ -314,16 +374,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         game["claim_open"] = False
         game["winner_id"] = None
         game["winner_name"] = None
-        game["likes_in_round"] = set()
+        game["pending_round_id"] = None
+        round_data["claim_taken"] = True
 
         schedule_timeout(context, chat_id)
 
         await query.answer(f"Тепер ви пояснюєте! 🔤 {new_word}", show_alert=True)
-        # Remove the claim buttons from previous message
+
+        # Leave the like button on the old message so people can still like.
         try:
-            await query.edit_message_reply_markup(reply_markup=None)
+            await query.edit_message_reply_markup(
+                reply_markup=_like_only_keyboard(round_id, len(round_data["likers"]))
+            )
         except Exception:
             pass
+
         await context.bot.send_message(
             chat_id,
             f"🐊 Тепер пояснює: <b>{user_name}</b>\n"
@@ -331,31 +396,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode="HTML",
             reply_markup=_leader_keyboard(),
         )
-
-    # ---- Like for previous explainer ----
-    elif data == "like":
-        prev_id = game.get("previous_explainer_id")
-        prev_name = game.get("previous_explainer_name")
-        if not prev_id:
-            await query.answer("Нема кого лайкати.", show_alert=True)
-            return
-        if user_id == prev_id:
-            await query.answer("Самому собі лайк ставити не можна 🙈", show_alert=True)
-            return
-        if user_id in game["likes_in_round"]:
-            await query.answer("Ви вже поставили лайк цього раунду.", show_alert=True)
-            return
-        game["likes_in_round"].add(user_id)
-        increment_likes(chat_id, prev_id, prev_name or "")
-        await query.answer(f"👍 Дякую! Лайк для {prev_name}.", show_alert=True)
-
-        # Update the button label with new like count
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=_claim_keyboard(len(game["likes_in_round"]))
-            )
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -387,23 +427,33 @@ async def guess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     cancel_timeout(game)
 
-    game["previous_explainer_id"] = game["leader_id"]
-    game["previous_explainer_name"] = game["leader_name"]
+    # Register a new round entry so that likes for this explanation are
+    # tracked separately and survive claim transitions.
+    round_id = game["next_round_id"]
+    game["next_round_id"] = round_id + 1
+    game["rounds"][round_id] = {
+        "explainer_id": game["leader_id"],
+        "explainer_name": game["leader_name"],
+        "likers": set(),
+        "claim_taken": False,
+    }
+
+    prev_name = game["leader_name"]
     game["winner_id"] = user.id
     game["winner_name"] = display_name
     game["claim_open"] = True
     game["claim_open_at"] = time.time()
-    game["likes_in_round"] = set()
+    game["pending_round_id"] = round_id
     game["leader_id"] = None  # no leader during the claim window
 
     await update.message.reply_text(
         f"🎉 <b>{display_name}</b> вгадав(ла) слово: <b>{word}</b>!\n"
-        f"Пояснював(ла): <b>{game['previous_explainer_name']}</b>\n\n"
+        f"Пояснював(ла): <b>{prev_name}</b>\n\n"
         f"🎯 Натисніть «Хочу пояснювати», щоб стати наступним.\n"
         f"Перші {CLAIM_PRIORITY_SECONDS} с — пріоритет у переможця, далі може будь-хто.\n\n"
-        f"👍 А ще можна подякувати лайком за пояснення.",
+        f"👍 А ще можна подякувати лайком за пояснення — кнопка залишиться і після передачі ходу.",
         parse_mode="HTML",
-        reply_markup=_claim_keyboard(),
+        reply_markup=_claim_keyboard(round_id, 0),
     )
 
 
