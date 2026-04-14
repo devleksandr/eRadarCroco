@@ -383,6 +383,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer("Зараз неможливо стати пояснюючим.", show_alert=True)
             return
 
+        # The previous explainer cannot claim the next round immediately.
+        if user_id == round_data["explainer_id"]:
+            await query.answer(
+                "Ви щойно пояснювали — пропустіть хоча б 1 раунд 😉",
+                show_alert=True,
+            )
+            return
+
         elapsed = time.time() - game["claim_open_at"]
         if elapsed < CLAIM_PRIORITY_SECONDS and user_id != game["winner_id"]:
             remaining = int(CLAIM_PRIORITY_SECONDS - elapsed) + 1
