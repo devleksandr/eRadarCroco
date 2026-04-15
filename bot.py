@@ -1,6 +1,7 @@
 import os
 import time
 import random
+import json
 import sqlite3
 import logging
 from pathlib import Path
@@ -53,10 +54,15 @@ def random_word() -> str:
 _APOSTROPHES = "'\u2019\u02bc\u02b9\u2018`\u00b4"
 
 
+_SEPARATORS = "- \t\u2010\u2011\u2012\u2013\u2014\u2015"
+
+
 def normalize(text: str) -> str:
-    """Lowercase and strip any apostrophes / spaces for guess comparison."""
+    """Lowercase and strip apostrophes, hyphens, and spaces for guess comparison."""
     text = text.strip().lower()
     for ch in _APOSTROPHES:
+        text = text.replace(ch, "")
+    for ch in _SEPARATORS:
         text = text.replace(ch, "")
     return text
 
@@ -90,6 +96,14 @@ def _db() -> sqlite3.Connection:
             score    INTEGER NOT NULL DEFAULT 0,
             likes    INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (chat_id, user_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS game_state (
+            chat_id  INTEGER PRIMARY KEY,
+            data     TEXT NOT NULL
         )
         """
     )
@@ -142,8 +156,90 @@ def get_top(chat_id: int, limit: int = 10) -> list[tuple[str, int, int]]:
     return rows
 
 
+def _game_to_json(game: dict) -> str:
+    """Serialize game state to JSON for DB storage."""
+    d = {
+        "word": game.get("word"),
+        "leader_id": game.get("leader_id"),
+        "leader_name": game.get("leader_name"),
+        "active": game.get("active", False),
+        "claim_open": game.get("claim_open", False),
+        "winner_id": game.get("winner_id"),
+        "winner_name": game.get("winner_name"),
+        "claim_open_at": game.get("claim_open_at", 0.0),
+        "pending_round_id": game.get("pending_round_id"),
+        "next_round_id": game.get("next_round_id", 1),
+        "used_words": list(game.get("used_words", set())),
+        "rounds": {
+            str(k): {
+                "explainer_id": v["explainer_id"],
+                "explainer_name": v["explainer_name"],
+                "likers": list(v["likers"]),
+                "claim_taken": v["claim_taken"],
+            }
+            for k, v in game.get("rounds", {}).items()
+        },
+    }
+    return json.dumps(d, ensure_ascii=False)
+
+
+def _game_from_json(raw: str) -> dict:
+    """Deserialize game state from JSON."""
+    d = json.loads(raw)
+    d["used_words"] = set(d.get("used_words", []))
+    d["timeout_job"] = None
+    rounds = {}
+    for k, v in d.get("rounds", {}).items():
+        rounds[int(k)] = {
+            "explainer_id": v["explainer_id"],
+            "explainer_name": v["explainer_name"],
+            "likers": set(v["likers"]),
+            "claim_taken": v["claim_taken"],
+        }
+    d["rounds"] = rounds
+    return d
+
+
+def save_game(chat_id: int, game: dict) -> None:
+    """Persist current game state to the database."""
+    conn = _db()
+    conn.execute(
+        "INSERT OR REPLACE INTO game_state (chat_id, data) VALUES (?, ?)",
+        (chat_id, _game_to_json(game)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_game_state(chat_id: int) -> None:
+    """Remove persisted game state when a game ends."""
+    conn = _db()
+    conn.execute("DELETE FROM game_state WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
+def load_all_games() -> dict[int, dict]:
+    """Load all persisted game states from the database."""
+    conn = _db()
+    rows = conn.execute("SELECT chat_id, data FROM game_state").fetchall()
+    conn.close()
+    result: dict[int, dict] = {}
+    for chat_id, data in rows:
+        try:
+            game = _game_from_json(data)
+            if game.get("active"):
+                result[chat_id] = game
+            else:
+                delete_game_state(chat_id)
+        except Exception:
+            logger.warning("Failed to restore game for chat %s, removing", chat_id)
+            delete_game_state(chat_id)
+    return result
+
+
 # ---------------------------------------------------------------------------
-# Game state (per-chat, in-memory)
+# Game state (per-chat, persisted via SQLite)
 # ---------------------------------------------------------------------------
 games: dict[int, dict] = {}
 
@@ -188,6 +284,7 @@ async def round_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     word = game.get("word")
     game["active"] = False
     game["timeout_job"] = None
+    delete_game_state(chat_id)
 
     text = "⏰ 10 хвилин минуло без вгадування — гра завершена."
     if word:
@@ -244,6 +341,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "used_words": used_words,  # lowercased words already guessed in this game
     }
 
+    save_game(chat_id, games[chat_id])
     schedule_timeout(context, chat_id)
 
     await update.message.reply_text(
@@ -264,6 +362,7 @@ async def cmd_stop(update: Update, _) -> None:
     if game and game.get("active"):
         game["active"] = False
         cancel_timeout(game)
+        delete_game_state(chat_id)
         await update.message.reply_text("🛑 Гру зупинено.")
     else:
         await update.message.reply_text("Зараз жодна гра не йде.")
@@ -324,6 +423,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         round_data["likers"].add(user_id)
         increment_likes(chat_id, round_data["explainer_id"], round_data["explainer_name"])
+        save_game(chat_id, game)
         await query.answer(
             f"👍 Дякую! Лайк для {round_data['explainer_name']}.",
             show_alert=True,
@@ -365,6 +465,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer("Тільки загадуючий може змінити слово!", show_alert=True)
             return
         game["word"] = pick_word(game["used_words"]).upper()
+        save_game(chat_id, game)
         await query.answer(f"🔤 {game['word']}", show_alert=True)
 
     # ---- Claim ("Хочу пояснювати") ----
@@ -411,6 +512,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         game["pending_round_id"] = None
         round_data["claim_taken"] = True
 
+        save_game(chat_id, game)
         schedule_timeout(context, chat_id)
 
         await query.answer(f"Тепер ви пояснюєте! 🔤 {new_word}", show_alert=True)
@@ -480,6 +582,8 @@ async def guess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     game["pending_round_id"] = round_id
     game["leader_id"] = None  # no leader during the claim window
 
+    save_game(chat_id, game)
+
     await update.message.reply_text(
         f"🎉 <b>{display_name}</b> вгадав(ла) слово: <b>{word}</b>!\n"
         f"Пояснював(ла): <b>{prev_name}</b>\n\n"
@@ -494,6 +598,20 @@ async def guess_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+async def post_init(app: Application) -> None:
+    """Restore active games from DB after bot restart."""
+    global games
+    restored = load_all_games()
+    if restored:
+        games.update(restored)
+        for chat_id, game in restored.items():
+            if game.get("active"):
+                game["timeout_job"] = app.job_queue.run_once(
+                    round_timeout_job, when=ROUND_TIMEOUT_SECONDS, chat_id=chat_id
+                )
+        logger.info("Restored %d active game(s) from database", len(restored))
+
+
 def main() -> None:
     load_words()
 
@@ -501,7 +619,7 @@ def main() -> None:
     if not token:
         raise RuntimeError("BOT_TOKEN not set. Create .env file with BOT_TOKEN=<your token>")
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
