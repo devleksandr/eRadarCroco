@@ -145,12 +145,12 @@ def increment_likes(chat_id: int, user_id: int, username: str) -> None:
     conn.close()
 
 
-def get_top(chat_id: int, limit: int = 10) -> list[tuple[str, int, int]]:
+def get_top(chat_id: int) -> list[tuple[str, int, int]]:
     conn = _db()
     rows = conn.execute(
         "SELECT username, score, likes FROM ratings WHERE chat_id = ? "
-        "ORDER BY score DESC, likes DESC LIMIT ?",
-        (chat_id, limit),
+        "ORDER BY score DESC, likes DESC",
+        (chat_id,),
     ).fetchall()
     conn.close()
     return rows
